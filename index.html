@@ -714,6 +714,25 @@ const FAR_END = rwyLocalToWorld(0, -RWY_LENGTH);
 const RUNWAY_DIR = FAR_END.clone().sub(THRESHOLD).normalize(); // threshold -> far end, i.e. landing roll direction
 const LANDING_HEADING = Math.atan2(RUNWAY_DIR.x, RUNWAY_DIR.z);
 
+// A handful of small wisps sitting right on the glidepath, so the aircraft
+// grazes through a bit of cloud on the way down instead of always descending
+// through clear air.
+const GLIDE_TAN = Math.tan(THREE.MathUtils.degToRad(3));
+const glideSideDir = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), RUNWAY_DIR).normalize();
+for (let i=0; i<8; i++) {
+  const d = THREE.MathUtils.lerp(400, 2600, Math.random()); // distance before threshold, along the descent
+  const pos = THRESHOLD.clone().sub(RUNWAY_DIR.clone().multiplyScalar(d));
+  pos.y = d * GLIDE_TAN + (Math.random()-0.5)*20;
+  pos.add(glideSideDir.clone().multiplyScalar((Math.random()-0.5)*60));
+
+  const mat = new THREE.SpriteMaterial({ map:cloudTexture, transparent:true, opacity:0.25 + Math.random()*0.2, depthWrite:false });
+  const sprite = new THREE.Sprite(mat);
+  const scale = 45 + Math.random()*55;
+  sprite.scale.set(scale, scale*0.55, 1);
+  sprite.position.copy(pos);
+  cloudGroup.add(sprite);
+}
+
 // ---------- Aircraft state ----------
 const G = 9.81;
 const MASS = 20000;
