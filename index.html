@@ -714,25 +714,6 @@ const FAR_END = rwyLocalToWorld(0, -RWY_LENGTH);
 const RUNWAY_DIR = FAR_END.clone().sub(THRESHOLD).normalize(); // threshold -> far end, i.e. landing roll direction
 const LANDING_HEADING = Math.atan2(RUNWAY_DIR.x, RUNWAY_DIR.z);
 
-// A handful of small wisps sitting right on the glidepath, so the aircraft
-// grazes through a bit of cloud on the way down instead of always descending
-// through clear air.
-const GLIDE_TAN = Math.tan(THREE.MathUtils.degToRad(3));
-const glideSideDir = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), RUNWAY_DIR).normalize();
-for (let i=0; i<8; i++) {
-  const d = THREE.MathUtils.lerp(400, 2600, Math.random()); // distance before threshold, along the descent
-  const pos = THRESHOLD.clone().sub(RUNWAY_DIR.clone().multiplyScalar(d));
-  pos.y = d * GLIDE_TAN + (Math.random()-0.5)*20;
-  pos.add(glideSideDir.clone().multiplyScalar((Math.random()-0.5)*60));
-
-  const mat = new THREE.SpriteMaterial({ map:cloudTexture, transparent:true, opacity:0.25 + Math.random()*0.2, depthWrite:false });
-  const sprite = new THREE.Sprite(mat);
-  const scale = 45 + Math.random()*55;
-  sprite.scale.set(scale, scale*0.55, 1);
-  sprite.position.copy(pos);
-  cloudGroup.add(sprite);
-}
-
 // ---------- Aircraft state ----------
 const G = 9.81;
 const MASS = 20000;
@@ -774,6 +755,42 @@ function resetFlight() {
   state.vel.copy(noseDir.multiplyScalar(speed));
 }
 resetFlight();
+
+// ---------- Wisps: small clouds spawned just ahead of the aircraft's actual
+// flight path, so it reliably grazes through a bit of cloud during descent
+// regardless of the exact line it flies (autopilot correcting onto final,
+// manual override, crosswind drift, etc.) ----------
+const wispGroup = new THREE.Group();
+scene.add(wispGroup);
+let nextWispIn = 3;
+function updateWisps(dt) {
+  if (state.crashed || state.landed) return;
+  nextWispIn -= dt;
+  if (nextWispIn <= 0 && state.pos.y > 15 && state.pos.y < 250) {
+    nextWispIn = 3.5 + Math.random() * 2.5;
+
+    const velDir = state.vel.length() > 0.1 ? state.vel.clone().normalize() : headingToVector(state.yaw, state.pitch);
+    const sideDir = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), velDir).normalize();
+    const ahead = 90 + Math.random() * 60; // ~1-2s ahead at approach speed
+    const pos = state.pos.clone()
+      .add(velDir.multiplyScalar(ahead))
+      .add(sideDir.multiplyScalar((Math.random()-0.5) * 25));
+    pos.y += (Math.random()-0.5) * 15;
+
+    const mat = new THREE.SpriteMaterial({ map:cloudTexture, transparent:true, opacity:0.35 + Math.random()*0.2, depthWrite:false });
+    const sprite = new THREE.Sprite(mat);
+    const scale = 40 + Math.random() * 35;
+    sprite.scale.set(scale, scale*0.55, 1);
+    sprite.position.copy(pos);
+    sprite.userData.life = 10;
+    wispGroup.add(sprite);
+  }
+  for (let i = wispGroup.children.length - 1; i >= 0; i--) {
+    const s = wispGroup.children[i];
+    s.userData.life -= dt;
+    if (s.userData.life <= 0) wispGroup.remove(s);
+  }
+}
 
 // ---------- Input ----------
 const keys = {};
@@ -1407,6 +1424,7 @@ function animate() {
   simTime += dt;
   physicsStep(dt);
   updateATC(dt);
+  updateWisps(dt);
   updateCamera(dt);
   updatePAPI();
   updateApproachLights(flightClock);
