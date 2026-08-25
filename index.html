@@ -874,6 +874,95 @@ function playSquelchTail() {
   } catch(e) {}
 }
 
+// ---------- Landing / rollout sound ----------
+// A low punchy impact for the instant the gear meets the runway, followed by a
+// continuous tire/reverse-thrust rumble whose pitch and volume track ground
+// speed — roaring right after touchdown, then fading out as the plane brakes
+// to a stop.
+function playTouchdownThud() {
+  try {
+    const ctx = getAudioCtx();
+    const bufferSize = Math.floor(ctx.sampleRate * 0.3);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0; i<bufferSize; i++) data[i] = Math.random()*2 - 1;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    const lowpass = ctx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 220;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.5, ctx.currentTime);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+    source.connect(lowpass); lowpass.connect(noiseGain); noiseGain.connect(ctx.destination);
+    source.start();
+    source.stop(ctx.currentTime + 0.3);
+
+    // low sine thump underneath the noise burst for extra weight on impact
+    const o = ctx.createOscillator();
+    const oGain = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(95, ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(40, ctx.currentTime + 0.22);
+    oGain.gain.setValueAtTime(0.35, ctx.currentTime);
+    oGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
+    o.connect(oGain); oGain.connect(ctx.destination);
+    o.start();
+    o.stop(ctx.currentTime + 0.26);
+  } catch(e) {}
+}
+
+let rolloutSound = null;
+function startRolloutSound() {
+  try {
+    const ctx = getAudioCtx();
+    const bufferSize = ctx.sampleRate * 2;
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0; i<bufferSize; i++) data[i] = Math.random()*2 - 1;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+
+    const lowpass = ctx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 300;
+    lowpass.Q.value = 0.5;
+
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+
+    source.connect(lowpass);
+    lowpass.connect(gain);
+    gain.connect(ctx.destination);
+    source.start();
+
+    rolloutSound = { ctx, source, lowpass, gain, stopped:false };
+  } catch(e) {}
+}
+function updateRolloutSound(speed) {
+  if (!rolloutSound || rolloutSound.stopped) return;
+  if (speed < 1.5) { stopRolloutSound(); return; }
+  const now = rolloutSound.ctx.currentTime;
+  const norm = THREE.MathUtils.clamp(speed / 80, 0, 1);
+  rolloutSound.gain.gain.setTargetAtTime(0.05 + norm * 0.24, now, 0.15);
+  rolloutSound.lowpass.frequency.setTargetAtTime(220 + norm * 1600, now, 0.2);
+}
+function stopRolloutSound() {
+  if (!rolloutSound || rolloutSound.stopped) return;
+  rolloutSound.stopped = true;
+  try {
+    const { ctx, source, gain } = rolloutSound;
+    const now = ctx.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(0, now + 0.5);
+    source.stop(now + 0.55);
+  } catch(e) {}
+}
+
 let cachedVoices = [];
 if (window.speechSynthesis) {
   const refreshVoices = () => { cachedVoices = window.speechSynthesis.getVoices(); };
@@ -917,21 +1006,27 @@ function autopilotStep(dt) {
   let targetRoll = -dev.loc * 0.004 + headingErr * 0.8;
   targetRoll = THREE.MathUtils.clamp(targetRoll, THREE.MathUtils.degToRad(-20), THREE.MathUtils.degToRad(20));
 
-  const flaring = altitude < 18 && alongRunway > -500;
-  let targetPitch;
-  if (flaring) {
-    // taper the sink rate down through the flare, but never all the way to zero —
-    // holding zero sink makes the plane balloon and float past the runway instead of touching down
-    const flareFactor = THREE.MathUtils.clamp(1 - altitude/18, 0, 1);
-    const targetVS = -3.5 + 3.0 * flareFactor;
-    const vsErr = targetVS - state.vel.y;
-    targetPitch = state.pitch + THREE.MathUtils.clamp(vsErr * 0.05, THREE.MathUtils.degToRad(-2), THREE.MathUtils.degToRad(2));
-    state.throttle = THREE.MathUtils.lerp(state.throttle, 0.12, Math.min(1, 3*dt));
-  } else {
-    targetPitch = THREE.MathUtils.degToRad(1) - THREE.MathUtils.clamp(dev.gs * 0.01, THREE.MathUtils.degToRad(-3), THREE.MathUtils.degToRad(3));
-    const speedErr = AP_TARGET_SPEED - state.vel.length();
-    state.throttle = THREE.MathUtils.clamp(state.throttle + speedErr * 0.015 * dt, 0, 1);
-  }
+  // Blend smoothly from glide-slope tracking into the flare over an altitude band,
+  // rather than switching modes at a hard threshold — a real autoland rounds out
+  // the descent gradually, and a discrete on/off switch reads as a pitch/throttle "pop".
+  const nearRunway = alongRunway > -500;
+  const flareTop = 26, flareBottom = 14;
+  const flareBlend = nearRunway ? THREE.MathUtils.clamp((flareTop - altitude) / (flareTop - flareBottom), 0, 1) : 0;
+
+  const glidePitch = THREE.MathUtils.degToRad(1) - THREE.MathUtils.clamp(dev.gs * 0.01, THREE.MathUtils.degToRad(-3), THREE.MathUtils.degToRad(3));
+  const speedErr = AP_TARGET_SPEED - state.vel.length();
+  const glideThrottle = THREE.MathUtils.clamp(state.throttle + speedErr * 0.015 * dt, 0, 1);
+
+  // taper the sink rate down through the flare, but never all the way to zero —
+  // holding zero sink makes the plane balloon and float past the runway instead of touching down
+  const flareFactor = THREE.MathUtils.clamp(1 - altitude/18, 0, 1);
+  const targetVS = -3.5 + 3.0 * flareFactor;
+  const vsErr = targetVS - state.vel.y;
+  const flarePitch = state.pitch + THREE.MathUtils.clamp(vsErr * 0.05, THREE.MathUtils.degToRad(-2), THREE.MathUtils.degToRad(2));
+  const flareThrottle = THREE.MathUtils.lerp(state.throttle, 0.12, Math.min(1, 3*dt));
+
+  const targetPitch = THREE.MathUtils.lerp(glidePitch, flarePitch, flareBlend);
+  state.throttle = THREE.MathUtils.lerp(glideThrottle, flareThrottle, flareBlend);
 
   const maxRollRate = THREE.MathUtils.degToRad(18) * dt;
   const maxPitchRate = THREE.MathUtils.degToRad(4) * dt;
@@ -1085,9 +1180,29 @@ const NIETZSCHE_QUOTES = [
 function randomFrom(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
 
 // ---------- Crash effects ----------
-let shake = { time:0, duration:1.2, mag:0.35 };
+let shake = { time:0, duration:1.2, mag:0.30 };
+
+// Band-limited noise for camera shake: each axis drifts toward a fresh random
+// target every frame instead of jumping straight to it, so the shake reads as
+// physical turbulence/impact motion rather than flickery per-frame static.
+function stepNoise(n, dt, rate) {
+  const a = 1 - Math.exp(-rate * dt);
+  n.x  += ((Math.random()-0.5) - n.x)  * a;
+  n.y  += ((Math.random()-0.5) - n.y)  * a;
+  n.rz += ((Math.random()-0.5) - n.rz) * a;
+  n.rx += ((Math.random()-0.5) - n.rx) * a;
+}
+let shakeNoise  = { x:0, y:0, rz:0, rx:0 };
+let rumbleNoise = { x:0, y:0, rz:0, rx:0 };
+
+// A small damped rebound that plays right after a soft touchdown: the main gear
+// compresses (camera dips), then kicks back up in a smaller secondary offshoot
+// before settling flat — the little rebound real gear oleos give on landing.
+let gearBounce = { time:0, duration:0.85, amp:0.24 };
 
 function triggerCrashEffects() {
+  shake.duration = 1.2;
+  shake.mag = 0.30;
   shake.time = shake.duration;
   const flash = document.getElementById('flash');
   flash.classList.add('hit');
@@ -1163,9 +1278,14 @@ function showResult(r) {
 }
 
 function triggerTouchdownBump() {
-  shake.duration = 0.4;
-  shake.time = 0.4;
-  shake.mag = 0.35;
+  // a good landing is a firm thump, not a crash — gentler than triggerCrashEffects,
+  // but with enough kick to actually feel like wheels hitting concrete
+  shake.duration = 0.55;
+  shake.time = 0.55;
+  shake.mag = 0.24;
+  gearBounce.time = gearBounce.duration;
+  playTouchdownThud();
+  startRolloutSound();
 }
 
 let stopped = false;
@@ -1176,6 +1296,11 @@ function quitGame() {
 }
 
 // ---------- Camera (cockpit) ----------
+// A lightly damped virtual rig: the cockpit eases toward the aircraft's actual
+// attitude instead of snapping to it every frame, like a mounted camera with a
+// touch of mechanical give. Keeps normal flight buttery-smooth even when the
+// autopilot or manual input makes a fast correction.
+let smoothCam = null;
 function updateCamera(dt) {
   const noseDir = headingToVector(state.yaw, state.pitch);
   const worldUp = new THREE.Vector3(0,1,0);
@@ -1184,27 +1309,55 @@ function updateCamera(dt) {
   const eyePos = state.pos.clone()
     .add(noseDir.clone().multiplyScalar(4.0))
     .add(rolledUp.clone().multiplyScalar(6.0));
+  const lookTarget = eyePos.clone().add(noseDir);
 
-  camera.up.copy(rolledUp);
-  camera.position.copy(eyePos);
-  camera.lookAt(eyePos.clone().add(noseDir));
+  if (!smoothCam) {
+    smoothCam = { pos: eyePos.clone(), up: rolledUp.clone(), look: lookTarget.clone() };
+  } else {
+    const posA = 1 - Math.exp(-14 * dt);
+    const upA  = 1 - Math.exp(-10 * dt);
+    smoothCam.pos.lerp(eyePos, posA);
+    smoothCam.up.lerp(rolledUp, upA).normalize();
+    smoothCam.look.lerp(lookTarget, posA);
+  }
+
+  camera.up.copy(smoothCam.up);
+  camera.position.copy(smoothCam.pos);
+  camera.lookAt(smoothCam.look);
 
   if (shake.time > 0) {
-    const s = shake.mag * (shake.time/shake.duration);
-    camera.position.x += (Math.random()-0.5)*s;
-    camera.position.y += (Math.random()-0.5)*s*1.2;
-    camera.rotateZ((Math.random()-0.5)*s*0.3);
-    camera.rotateX((Math.random()-0.5)*s*0.2);
+    stepNoise(shakeNoise, dt, 16);
+    // ease-out falloff so the shake settles rather than cutting off abruptly
+    const envelope = Math.pow(Math.max(0, shake.time/shake.duration), 1.6);
+    const s = shake.mag * envelope;
+    camera.position.x += shakeNoise.x * s;
+    camera.position.y += shakeNoise.y * s * 1.2;
+    camera.rotateZ(shakeNoise.rz * s * 0.3);
+    camera.rotateX(shakeNoise.rx * s * 0.2);
     shake.time -= dt;
   }
 
   if (state.landed) {
+    stepNoise(rumbleNoise, dt, 24);
     const rollSpeed = state.vel.length();
-    const rumble = THREE.MathUtils.clamp(rollSpeed / 40, 0, 1) * 0.09;
-    camera.position.x += (Math.random()-0.5)*rumble;
-    camera.position.y += (Math.random()-0.5)*rumble*1.2;
-    camera.rotateZ((Math.random()-0.5)*rumble*0.2);
-    camera.rotateX((Math.random()-0.5)*rumble*0.15);
+    const rumble = THREE.MathUtils.clamp(rollSpeed / 40, 0, 1) * 0.11;
+    camera.position.x += rumbleNoise.x * rumble;
+    camera.position.y += rumbleNoise.y * rumble * 1.2;
+    camera.rotateZ(rumbleNoise.rz * rumble * 0.2);
+    camera.rotateX(rumbleNoise.rx * rumble * 0.15);
+  }
+
+  if (gearBounce.time > 0) {
+    const tNorm = 1 - gearBounce.time/gearBounce.duration; // 0 -> 1 across the bounce
+    // decay slow enough that the rebound half of the cycle is still clearly visible,
+    // not just the initial dip
+    const decay = Math.exp(-tNorm * 1.5);
+    // one full cycle: dip down (compression) at 1/4, cross neutral at 1/2,
+    // kick back up (the offshoot rebound) at 3/4, settle flat by the end
+    const osc = -Math.sin(tNorm * Math.PI * 2) * decay;
+    camera.position.y += osc * gearBounce.amp;
+    camera.rotateX(osc * gearBounce.amp * 0.25);
+    gearBounce.time -= dt;
   }
 }
 
@@ -1383,6 +1536,7 @@ function animate() {
   simTime += dt;
   physicsStep(dt);
   updateATC(dt);
+  if (state.landed && !state.crashed) updateRolloutSound(state.vel.length());
   updateCamera(dt);
   updatePAPI();
   updateApproachLights(flightClock);
